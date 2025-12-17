@@ -19,7 +19,7 @@ st.title("📄 Word Graph, PageRank & Community Detection (Louvain)")
 # =========================
 # 1. Load PDF dari PATH
 # =========================
-PDF_PATH = "data/happiness.pdf"
+PDF_PATH = "happiness.pdf"
 st.info(f"PDF path: `{PDF_PATH}`")
 
 if not os.path.exists(PDF_PATH):
