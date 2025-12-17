@@ -9,18 +9,18 @@ import matplotlib.cm as cm
 
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords, words as nltk_words
-from collections import Counter
+from collections import Counter, defaultdict
 from itertools import combinations
 from community.community_louvain import best_partition
 
-# ===============================
+# ======================================================
 # KONFIGURASI
-# ===============================
-PDF_PATH = "happiness.pdf" 
+# ======================================================
+PDF_PATH = "happiness.pdf"
 
-# ===============================
-# DOWNLOAD RESOURCE NLTK (CLOUD)
-# ===============================
+# ======================================================
+# NLTK DOWNLOAD (CLOUD SAFE)
+# ======================================================
 @st.cache_resource
 def download_nltk():
     nltk.download("punkt")
@@ -29,168 +29,161 @@ def download_nltk():
 
 download_nltk()
 
-# ===============================
+# ======================================================
 # STOPWORDS
-# ===============================
-stop_id = set(stopwords.words("indonesian"))
-stop_en = set(stopwords.words("english"))
-STOP_WORDS = stop_id.union(stop_en)
-
+# ======================================================
+STOP_WORDS = set(stopwords.words("indonesian")).union(
+    set(stopwords.words("english"))
+)
 ENGLISH_WORDS = set(nltk_words.words("en"))
 
-# ===============================
-# FUNGSI (IDENTIK LOGIKA NOTEBOOK)
-# ===============================
-def extract_text_from_pdf(pdf_path: str) -> str:
-    st.write(f"📄 Memproses PDF: `{pdf_path}`")
-    md_text = pymupdf4llm.to_markdown(pdf_path)
-    st.write(f"📝 Panjang teks: {len(md_text)} karakter")
-    return md_text
+# ======================================================
+# FUNGSI NLP & GRAPH
+# ======================================================
+def extract_text_from_pdf(pdf_path):
+    text = pymupdf4llm.to_markdown(pdf_path)
+    return text
 
 
-def preprocess_sentence(sentence: str):
+def preprocess_sentence(sentence):
     tokens = word_tokenize(sentence)
-    tokens = [t.lower() for t in tokens]
-    tokens = [t for t in tokens if t.isalpha()]
+    tokens = [t.lower() for t in tokens if t.isalpha()]
     tokens = [t for t in tokens if len(t) > 2]
     tokens = [t for t in tokens if t not in STOP_WORDS]
     tokens = [t for t in tokens if t in ENGLISH_WORDS]
     return tokens
 
 
-def build_cooccurrence_matrix(sentences_tokens):
+def build_cooccurrence(sentences_tokens):
     pair_counts = Counter()
 
     for sent in sentences_tokens:
         unique_words = list(set(sent))
         for w1, w2 in combinations(unique_words, 2):
-            if w1 == w2:
-                continue
-            pair = tuple(sorted((w1, w2)))
-            pair_counts[pair] += 1
+            pair_counts[tuple(sorted((w1, w2)))] += 1
 
     vocab = sorted({w for pair in pair_counts for w in pair})
-    N = len(vocab)
-
-    cooc_matrix = np.zeros((N, N), dtype=int)
-    word_to_idx = {w: i for i, w in enumerate(vocab)}
-
-    for (w1, w2), c in pair_counts.items():
-        i, j = word_to_idx[w1], word_to_idx[w2]
-        cooc_matrix[i, j] = c
-        cooc_matrix[j, i] = c
-
-    cooc_df = pd.DataFrame(cooc_matrix, index=vocab, columns=vocab)
-
-    st.write(f"📌 Vocab size: {N}")
-    st.write(f"📌 Jumlah pasangan kata: {len(pair_counts)}")
-
-    return vocab, cooc_df, pair_counts
+    return vocab, pair_counts
 
 
-def build_word_graph_and_pagerank(vocab, pair_counts, weight_threshold=0):
+def build_graph_and_pagerank(vocab, pair_counts, threshold):
     G = nx.Graph()
     G.add_nodes_from(vocab)
 
     for (w1, w2), c in pair_counts.items():
-        if c > weight_threshold:
+        if c > threshold:
             G.add_edge(w1, w2, weight=c)
 
-    pagerank_scores = nx.pagerank(G, weight="weight")
-
-    st.write(
-        f"🕸️ Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges"
+    pagerank = nx.pagerank(
+        G, weight="weight", max_iter=100, tol=1e-6
     )
-    return G, pagerank_scores
+    return G, pagerank
 
+# ======================================================
+# 🔧 VISUALISASI KOMUNITAS (FIXED & SUBGRAPH)
+# ======================================================
+def visualize_communities_fixed(G, partition, min_degree=2, min_size=20):
+    # Filter node degree kecil
+    G = G.subgraph([n for n in G.nodes() if G.degree(n) >= min_degree])
 
-def visualize_word_graph(G, pagerank_scores, top_n=30):
-    selected_nodes = [
-        w for w, _ in sorted(
-            pagerank_scores.items(), key=lambda x: x[1], reverse=True
-        )[:top_n]
-    ]
+    # Kelompok komunitas
+    comm_groups = defaultdict(list)
+    for node, cid in partition.items():
+        if node in G:
+            comm_groups[cid].append(node)
 
-    subG = G.subgraph(selected_nodes).copy()
-    pos = nx.spring_layout(subG, k=0.6, iterations=100)
+    # Ambil komunitas besar saja
+    selected_nodes = []
+    for cid, nodes in comm_groups.items():
+        if len(nodes) >= min_size:
+            selected_nodes.extend(nodes)
 
-    pr_values = np.array([pagerank_scores[n] for n in subG.nodes()])
-    node_sizes = 300 + 4000 * (pr_values - pr_values.min()) / (
-        pr_values.max() - pr_values.min() + 1e-9
+    subG = G.subgraph(selected_nodes)
+
+    # Layout
+    pos = nx.spring_layout(
+        subG,
+        k=2 / np.sqrt(subG.number_of_nodes()),
+        iterations=300,
+        seed=42
     )
 
-    weights = [subG[u][v]["weight"] for u, v in subG.edges()]
-    edge_widths = [1 + 5 * (w / max(weights)) for w in weights]
-
-    plt.figure(figsize=(14, 14))
-    nx.draw_networkx_nodes(subG, pos, node_size=node_sizes)
-    nx.draw_networkx_edges(subG, pos, width=edge_widths, alpha=0.3)
-    nx.draw_networkx_labels(subG, pos, font_size=9)
-    plt.title(f"Word Graph Top {top_n} (PageRank)")
-    plt.axis("off")
-
-    st.pyplot(plt)
-    plt.clf()
-
-
-def visualize_communities(G, partition):
-    pos = nx.spring_layout(G, k=0.6, iterations=100)
-    num_communities = len(set(partition.values()))
-    cmap = cm.get_cmap("viridis", num_communities)
+    num_comms = len(set(partition[n] for n in subG.nodes()))
+    cmap = cm.get_cmap("tab20", num_comms)
 
     node_colors = [
-        cmap(partition[n] / (num_communities - 1)) for n in G.nodes()
+        cmap(partition[n] % num_comms) for n in subG.nodes()
     ]
 
-    plt.figure(figsize=(16, 16))
-    nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=600)
-    nx.draw_networkx_edges(G, pos, alpha=0.2)
-    nx.draw_networkx_labels(G, pos, font_size=7)
-    plt.title("Community Detection (Louvain)")
-    plt.axis("off")
+    weights = [subG[u][v]["weight"] for u, v in subG.edges()]
+    w_min, w_max = min(weights), max(weights)
+    edge_widths = [
+        0.5 + 4 * (w - w_min) / (w_max - w_min + 1e-9)
+        for w in weights
+    ]
 
+    plt.figure(figsize=(18, 18))
+    nx.draw_networkx_nodes(
+        subG, pos,
+        node_color=node_colors,
+        node_size=500,
+        alpha=0.9
+    )
+    nx.draw_networkx_edges(
+        subG, pos,
+        width=edge_widths,
+        alpha=0.4
+    )
+    nx.draw_networkx_labels(subG, pos, font_size=7)
+
+    plt.title("Community Detection (Louvain) – Subgraph Visualization")
+    plt.axis("off")
     st.pyplot(plt)
     plt.clf()
 
-# ===============================
+# ======================================================
 # STREAMLIT APP
-# ===============================
-st.title("📄 Word Graph NLP (PDF dari Path)")
-st.write("Analisis Co-occurrence, PageRank, dan Louvain")
+# ======================================================
+st.set_page_config(layout="wide")
+st.title("📄 Word Graph NLP – Community Subgraph")
 
 top_n = st.slider("Top-N PageRank", 10, 100, 30)
-weight_threshold = st.slider("Threshold Co-occurrence", 0, 5, 0)
+threshold = st.slider("Threshold Co-occurrence", 0, 5, 2)
 
 if st.button("🚀 Jalankan Analisis"):
     with st.spinner("Memproses PDF..."):
-        raw_text = extract_text_from_pdf(PDF_PATH)
+        text = extract_text_from_pdf(PDF_PATH)
+        sentences = sent_tokenize(text)
 
-        raw_sentences = sent_tokenize(raw_text)
-        sentences_tokens = [
-            preprocess_sentence(s) for s in raw_sentences
+        tokens = [
+            preprocess_sentence(s) for s in sentences
         ]
-        sentences_tokens = [s for s in sentences_tokens if len(s) > 1]
+        tokens = [s for s in tokens if len(s) > 1]
 
-        vocab, cooc_df, pair_counts = build_cooccurrence_matrix(sentences_tokens)
-        G, pagerank_scores = build_word_graph_and_pagerank(
-            vocab, pair_counts, weight_threshold
+        vocab, pair_counts = build_cooccurrence(tokens)
+        G, pagerank = build_graph_and_pagerank(
+            vocab, pair_counts, threshold
         )
+
+        partition = best_partition(G)
 
     st.success("Analisis selesai ✅")
 
+    # ===============================
+    # OUTPUT PAGE RANK
+    # ===============================
     st.subheader("📊 Top PageRank Words")
     pr_df = (
         pd.DataFrame(
-            [{"word": w, "pagerank": s} for w, s in pagerank_scores.items()]
+            [{"word": w, "pagerank": s} for w, s in pagerank.items()]
         )
         .sort_values("pagerank", ascending=False)
         .head(top_n)
     )
     st.dataframe(pr_df)
 
-    st.subheader("🕸️ Word Graph")
-    visualize_word_graph(G, pagerank_scores, top_n)
-
-    st.subheader("🧩 Community Detection")
-    partition = best_partition(G)
-    visualize_communities(G, partition)
+    # ===============================
+    # VISUALISASI KOMUNITAS
+    # ===============================
+    st.subheader("🧩 Community Graph (Filtered & Readable)")
+    visualize_communities_fixed(G, partition)
