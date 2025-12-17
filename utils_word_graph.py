@@ -5,15 +5,29 @@ from itertools import combinations
 import pymupdf4llm
 import nltk
 import networkx as nx
-import numpy as np
 
-from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords, words as nltk_words
 from community.community_louvain import best_partition
 
-nltk.download("punkt")
-nltk.download("stopwords")
-nltk.download("words")
+# =========================
+# FIX NLTK RESOURCES
+# =========================
+def ensure_nltk_resources():
+    resources = [
+        "tokenizers/punkt",
+        "tokenizers/punkt_tab",
+        "corpora/stopwords",
+        "corpora/words"
+    ]
+    for r in resources:
+        try:
+            nltk.data.find(r)
+        except LookupError:
+            nltk.download(r.split("/")[-1])
+
+ensure_nltk_resources()
+# =========================
 
 STOP_WORDS = set(stopwords.words("indonesian")).union(
     set(stopwords.words("english"))
