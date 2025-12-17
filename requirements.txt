@@ -4,5 +4,5 @@ nltk
 networkx
 numpy
 pandas
+matplotlib
 python-louvain
-pyvis
