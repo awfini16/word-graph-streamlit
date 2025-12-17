@@ -1,136 +1,196 @@
-# app.py
 import streamlit as st
-from pyvis.network import Network
-import tempfile
-import os
+import nltk
+import pymupdf4llm
+import networkx as nx
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 
-from nltk.tokenize import sent_tokenize
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import stopwords, words as nltk_words
+from collections import Counter
+from itertools import combinations
+from community.community_louvain import best_partition
 
-from utils_word_graph import (
-    extract_text_from_pdf,
-    preprocess_sentence,
-    build_word_graph,
-    detect_communities
-)
+# ===============================
+# KONFIGURASI
+# ===============================
+PDF_PATH = "happiness.pdf" 
 
-st.set_page_config(layout="wide")
-st.title("📄 Word Graph, PageRank & Community Detection (Louvain)")
+# ===============================
+# DOWNLOAD RESOURCE NLTK (CLOUD)
+# ===============================
+@st.cache_resource
+def download_nltk():
+    nltk.download("punkt")
+    nltk.download("stopwords")
+    nltk.download("words")
 
-# =========================
-# 1. Load PDF dari PATH
-# =========================
-PDF_PATH = "happiness.pdf"
-st.info(f"PDF path: `{PDF_PATH}`")
+download_nltk()
 
-if not os.path.exists(PDF_PATH):
-    st.error("File PDF tidak ditemukan!")
-    st.stop()
+# ===============================
+# STOPWORDS
+# ===============================
+stop_id = set(stopwords.words("indonesian"))
+stop_en = set(stopwords.words("english"))
+STOP_WORDS = stop_id.union(stop_en)
 
-# =========================
-# 2. Proses NLP
-# =========================
-with st.spinner("Memproses PDF & membangun word graph..."):
-    raw_text = extract_text_from_pdf(PDF_PATH)
-    sentences = sent_tokenize(raw_text)
-    sentences_tokens = [
-        preprocess_sentence(s) for s in sentences if len(s) > 1
+ENGLISH_WORDS = set(nltk_words.words("en"))
+
+# ===============================
+# FUNGSI (IDENTIK LOGIKA NOTEBOOK)
+# ===============================
+def extract_text_from_pdf(pdf_path: str) -> str:
+    st.write(f"📄 Memproses PDF: `{pdf_path}`")
+    md_text = pymupdf4llm.to_markdown(pdf_path)
+    st.write(f"📝 Panjang teks: {len(md_text)} karakter")
+    return md_text
+
+
+def preprocess_sentence(sentence: str):
+    tokens = word_tokenize(sentence)
+    tokens = [t.lower() for t in tokens]
+    tokens = [t for t in tokens if t.isalpha()]
+    tokens = [t for t in tokens if len(t) > 2]
+    tokens = [t for t in tokens if t not in STOP_WORDS]
+    tokens = [t for t in tokens if t in ENGLISH_WORDS]
+    return tokens
+
+
+def build_cooccurrence_matrix(sentences_tokens):
+    pair_counts = Counter()
+
+    for sent in sentences_tokens:
+        unique_words = list(set(sent))
+        for w1, w2 in combinations(unique_words, 2):
+            if w1 == w2:
+                continue
+            pair = tuple(sorted((w1, w2)))
+            pair_counts[pair] += 1
+
+    vocab = sorted({w for pair in pair_counts for w in pair})
+    N = len(vocab)
+
+    cooc_matrix = np.zeros((N, N), dtype=int)
+    word_to_idx = {w: i for i, w in enumerate(vocab)}
+
+    for (w1, w2), c in pair_counts.items():
+        i, j = word_to_idx[w1], word_to_idx[w2]
+        cooc_matrix[i, j] = c
+        cooc_matrix[j, i] = c
+
+    cooc_df = pd.DataFrame(cooc_matrix, index=vocab, columns=vocab)
+
+    st.write(f"📌 Vocab size: {N}")
+    st.write(f"📌 Jumlah pasangan kata: {len(pair_counts)}")
+
+    return vocab, cooc_df, pair_counts
+
+
+def build_word_graph_and_pagerank(vocab, pair_counts, weight_threshold=0):
+    G = nx.Graph()
+    G.add_nodes_from(vocab)
+
+    for (w1, w2), c in pair_counts.items():
+        if c > weight_threshold:
+            G.add_edge(w1, w2, weight=c)
+
+    pagerank_scores = nx.pagerank(G, weight="weight")
+
+    st.write(
+        f"🕸️ Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges"
+    )
+    return G, pagerank_scores
+
+
+def visualize_word_graph(G, pagerank_scores, top_n=30):
+    selected_nodes = [
+        w for w, _ in sorted(
+            pagerank_scores.items(), key=lambda x: x[1], reverse=True
+        )[:top_n]
     ]
 
-    G, pagerank_scores = build_word_graph(
-        sentences_tokens,
-        weight_threshold=1
+    subG = G.subgraph(selected_nodes).copy()
+    pos = nx.spring_layout(subG, k=0.6, iterations=100)
+
+    pr_values = np.array([pagerank_scores[n] for n in subG.nodes()])
+    node_sizes = 300 + 4000 * (pr_values - pr_values.min()) / (
+        pr_values.max() - pr_values.min() + 1e-9
     )
 
-st.success(
-    f"Graph: {G.number_of_nodes()} nodes | {G.number_of_edges()} edges"
-)
+    weights = [subG[u][v]["weight"] for u, v in subG.edges()]
+    edge_widths = [1 + 5 * (w / max(weights)) for w in weights]
 
-# =========================
-# 3. FULL WORD GRAPH (PyVis)
-# =========================
-st.subheader("🕸️ Word Graph (FULL – Semua Token)")
+    plt.figure(figsize=(14, 14))
+    nx.draw_networkx_nodes(subG, pos, node_size=node_sizes)
+    nx.draw_networkx_edges(subG, pos, width=edge_widths, alpha=0.3)
+    nx.draw_networkx_labels(subG, pos, font_size=9)
+    plt.title(f"Word Graph Top {top_n} (PageRank)")
+    plt.axis("off")
 
-net_full = Network(
-    height="700px",
-    width="100%",
-    bgcolor="#ffffff",
-    font_color="black"
-)
+    st.pyplot(plt)
+    plt.clf()
 
-for node in G.nodes():
-    net_full.add_node(
-        node,
-        label=node,
-        value=pagerank_scores[node] * 10000
+
+def visualize_communities(G, partition):
+    pos = nx.spring_layout(G, k=0.6, iterations=100)
+    num_communities = len(set(partition.values()))
+    cmap = cm.get_cmap("viridis", num_communities)
+
+    node_colors = [
+        cmap(partition[n] / (num_communities - 1)) for n in G.nodes()
+    ]
+
+    plt.figure(figsize=(16, 16))
+    nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=600)
+    nx.draw_networkx_edges(G, pos, alpha=0.2)
+    nx.draw_networkx_labels(G, pos, font_size=7)
+    plt.title("Community Detection (Louvain)")
+    plt.axis("off")
+
+    st.pyplot(plt)
+    plt.clf()
+
+# ===============================
+# STREAMLIT APP
+# ===============================
+st.title("📄 Word Graph NLP (PDF dari Path)")
+st.write("Analisis Co-occurrence, PageRank, dan Louvain")
+
+top_n = st.slider("Top-N PageRank", 10, 100, 30)
+weight_threshold = st.slider("Threshold Co-occurrence", 0, 5, 0)
+
+if st.button("🚀 Jalankan Analisis"):
+    with st.spinner("Memproses PDF..."):
+        raw_text = extract_text_from_pdf(PDF_PATH)
+
+        raw_sentences = sent_tokenize(raw_text)
+        sentences_tokens = [
+            preprocess_sentence(s) for s in raw_sentences
+        ]
+        sentences_tokens = [s for s in sentences_tokens if len(s) > 1]
+
+        vocab, cooc_df, pair_counts = build_cooccurrence_matrix(sentences_tokens)
+        G, pagerank_scores = build_word_graph_and_pagerank(
+            vocab, pair_counts, weight_threshold
+        )
+
+    st.success("Analisis selesai ✅")
+
+    st.subheader("📊 Top PageRank Words")
+    pr_df = (
+        pd.DataFrame(
+            [{"word": w, "pagerank": s} for w, s in pagerank_scores.items()]
+        )
+        .sort_values("pagerank", ascending=False)
+        .head(top_n)
     )
+    st.dataframe(pr_df)
 
-for u, v, d in G.edges(data=True):
-    net_full.add_edge(u, v, value=d["weight"])
+    st.subheader("🕸️ Word Graph")
+    visualize_word_graph(G, pagerank_scores, top_n)
 
-tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
-net_full.save_graph(tmp_file.name)
-
-st.components.v1.html(
-    open(tmp_file.name, "r", encoding="utf-8").read(),
-    height=750,
-    scrolling=True
-)
-
-# =========================
-# 4. Community Detection (Louvain)
-# =========================
-st.subheader("🧩 Community Detection (Louvain)")
-
-partition = detect_communities(G)
-communities = sorted(set(partition.values()))
-
-selected_community = st.selectbox(
-    "Pilih Community ID",
-    communities
-)
-
-# ambil node dalam community terpilih
-community_nodes = [
-    n for n, c in partition.items()
-    if c == selected_community
-]
-
-subG = G.subgraph(community_nodes).copy()
-
-st.write(
-    f"Community {selected_community}: "
-    f"{subG.number_of_nodes()} nodes | "
-    f"{subG.number_of_edges()} edges"
-)
-
-# =========================
-# 5. Word Community Graph (PyVis)
-# =========================
-st.subheader("🎨 Word Community Graph (Interaktif)")
-
-net_comm = Network(
-    height="700px",
-    width="100%",
-    bgcolor="#ffffff",
-    font_color="black"
-)
-
-for node in subG.nodes():
-    net_comm.add_node(
-        node,
-        label=node,
-        value=pagerank_scores[node] * 10000,
-        color="#1f77b4"
-    )
-
-for u, v, d in subG.edges(data=True):
-    net_comm.add_edge(u, v, value=d["weight"])
-
-tmp_comm = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
-net_comm.save_graph(tmp_comm.name)
-
-st.components.v1.html(
-    open(tmp_comm.name, "r", encoding="utf-8").read(),
-    height=750,
-    scrolling=True
-)
+    st.subheader("🧩 Community Detection")
+    partition = best_partition(G)
+    visualize_communities(G, partition)
