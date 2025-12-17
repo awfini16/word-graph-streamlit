@@ -1,0 +1,8 @@
+streamlit
+pymupdf4llm
+nltk
+networkx
+numpy
+pandas
+python-louvain
+pyvis
